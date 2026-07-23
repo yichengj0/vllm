@@ -470,7 +470,9 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supports_sink(cls) -> bool:
-        """FlashInfer supports sinks only on the SM100 trtllm-gen path."""
+        """Sinks run on the SM100 trtllm-gen path (prefill + decode) and on
+        SM12x, where XQA decode and the FI native fa2 prefill both take a
+        per-head sink term."""
         from vllm.utils.flashinfer import (
             force_use_trtllm_attention,
         )
@@ -479,6 +481,9 @@ class FlashInferBackend(AttentionBackend):
         # --attention-config.use_trtllm_attention=0)
         if force_use_trtllm_attention() is False:
             return False
+
+        if current_platform.is_device_capability_family(120):
+            return supports_trtllm_attention(is_prefill=False)
 
         if not current_platform.is_device_capability_family(100):
             return False
@@ -767,9 +772,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
             self.use_trtllm_decode_attention = False
             self.flashinfer_trtllm_api_decode_kernel = None
+        # trtllm-gen applies an implicit causal draft mask; XQA takes an
+        # explicit packed causal mask, wired for SM12x (SM90 XQA stays
+        # single-token decode until it is validated there too).
         supports_spec_as_decode = (
             self.flashinfer_trtllm_api_decode_kernel
             == FlashInferDecodeKernel.TRTLLM_GEN
+        ) or (
+            self.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.XQA
+            and current_platform.is_device_capability_family(120)
         )
         self._init_reorder_batch_threshold(
             1,
@@ -963,7 +974,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
     @staticmethod
     def _get_flashinfer_trtllm_api_decode_kernel() -> FlashInferDecodeKernel:
-        if current_platform.is_device_capability(90):
+        if current_platform.is_device_capability(
+            90
+        ) or current_platform.is_device_capability_family(120):
             return FlashInferDecodeKernel.XQA
         assert current_platform.is_device_capability_family(100)
         return FlashInferDecodeKernel.TRTLLM_GEN
@@ -1184,7 +1197,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
 
         if not all_uses_trtllm:
-            if self.has_sinks:
+            # On SM12x sinks still work outside the trtllm API: the FI-native
+            # fa2 prefill applies the sink term itself (passed at run()), so
+            # only the decode side must be on XQA (and not DCP).
+            sinks_ok_on_sm12x = (
+                current_platform.is_device_capability_family(120)
+                and not self.use_dcp
+                and (num_decodes == 0 or decode_with_flashinfer_trtllm_api)
+            )
+            if self.has_sinks and not sinks_ok_on_sm12x:
                 raise NotImplementedError(
                     "FlashInfer backend currently does not support attention "
                     "sinks, please use trtllm on blackwell or flash attention "
@@ -1587,6 +1608,11 @@ class FlashInferImpl(AttentionImpl):
         self.supports_xqa_or_trtllm_gen_decode = can_use_trtllm_attention(
             num_heads, num_kv_heads, is_prefill=False
         )
+        # Packed causal draft-block masks for XQA speculative decode, keyed by
+        # q_len and grown to the largest batch seen. Contents are identical
+        # per request, so the buffer is filled once and sliced per call; the
+        # stable storage keeps it CUDA-graph safe at a fixed batch size.
+        self._xqa_spec_mask_cache: dict[int, torch.Tensor] = {}
         vllm_config = get_current_vllm_config_or_none()
         # Query pre-quantization needs a single dtype for the whole query tensor.
         # SM90 XQA needs BF16/FP16-Q for decode and FP8 for prefill,
@@ -1652,6 +1678,32 @@ class FlashInferImpl(AttentionImpl):
                 bmm1_scale *= layer._q_scale_float
             bmm1_scale *= layer._k_scale_float
         return bmm1_scale
+
+    def get_xqa_spec_dec_mask(
+        self, num_decodes: int, q_len: int, device: torch.device
+    ) -> torch.Tensor:
+        """Packed causal draft-block mask for XQA speculative decode.
+
+        Shape [num_decodes, q_len, ceil(q_len/32)*2] uint16, bit j of row i
+        set iff draft token i may attend draft token j (j <= i); the KV
+        prefix is always visible so it needs no bits.
+        """
+        cached = self._xqa_spec_mask_cache.get(q_len)
+        if cached is None or cached.shape[0] < num_decodes:
+            n_words = (q_len + 31) // 32
+            qi = torch.arange(q_len, dtype=torch.int64).unsqueeze(1)
+            ki = torch.arange(n_words * 32, dtype=torch.int64).unsqueeze(0)
+            bool_mask = ki <= qi
+            bits = torch.tensor([1 << b for b in range(32)], dtype=torch.int64)
+            words = (
+                (bool_mask.view(q_len, n_words, 32) * bits).sum(-1).to(torch.uint32)
+            )
+            row = words.view(torch.uint16).reshape(q_len, n_words * 2)
+            cached = (
+                row.unsqueeze(0).expand(num_decodes, -1, -1).contiguous().to(device)
+            )
+            self._xqa_spec_mask_cache[q_len] = cached
+        return cached[:num_decodes]
 
     # SM90 may need FP8-Q for native prefill and BF16/FP16-Q for XQA decode,
     # so quantize only the slice whose target dtype differs.
@@ -1930,6 +1982,9 @@ class FlashInferImpl(AttentionImpl):
                         v_scale=layer._v_scale_float,
                         out=out_prefill,
                         kv_cache_sf=kv_cache_sf,
+                        # fa2 prefill applies the attention-sink softmax term;
+                        # needed on SM12x where sink models decode via XQA.
+                        sinks=self.sinks,
                     )
 
                     if needs_fp8_out_prefill:
@@ -2185,9 +2240,14 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
 
+                # XQA takes an explicit packed causal mask over the draft
+                # block (trtllm-gen masks implicitly).
+                xqa_spec_mask = None
                 if decode_with_xqa and q_len_per_req > 1:
-                    raise NotImplementedError(
-                        "FlashInfer XQA speculative decode is not wired in vLLM yet."
+                    xqa_spec_mask = self.get_xqa_spec_dec_mask(
+                        attn_metadata.num_decodes,
+                        q_len_per_req,
+                        decode_query.device,
                     )
 
                 # XQA decode can use model-dtype Q with FP8 KV, so only include
@@ -2229,6 +2289,7 @@ class FlashInferImpl(AttentionImpl):
                     kv_layout=get_kv_cache_layout(),
                     backend=attn_metadata.decode.kernel.value,
                     q_len_per_req=q_len_per_req,
+                    mask=xqa_spec_mask,
                     kv_cache_sf=(
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     ),
