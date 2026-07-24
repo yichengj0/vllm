@@ -13,7 +13,7 @@ Changes:
 - Support speculative decode by passing XQA an explicit packed causal draft mask, cached per draft length so it is safe under CUDA graphs.
 - Relax the metadata-builder guard so a batch with sinks is allowed when decode runs on XQA even though prefill runs on the native kernel.
 
-This needs a FlashInfer build with the XQA speculative-decode sliding-window fix (flashinfer-ai/flashinfer#TBD). Plain sink models work with released FlashInfer. NVFP4 KV cache during prefill is still unsupported on SM12x.
+This needs a FlashInfer build with the XQA speculative-decode sliding-window fix (flashinfer-ai/flashinfer#4137). Plain sink models work with released FlashInfer. NVFP4 KV cache during prefill is still unsupported on SM12x.
 
 ## Test Plan
 
